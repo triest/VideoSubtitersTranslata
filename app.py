@@ -7,8 +7,10 @@ import re
 import shutil
 import subprocess
 import threading
+import uuid
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -98,7 +100,7 @@ class SubtitleApp(tk.Tk):
         ttk.Label(row, text="Переводчик: встроенная модель EN → RU").pack(side="left")
         ttk.Label(opts, text="Перевод выполняется без Ollama и интернета. Модель встроена в программу.", wraplength=620).pack(anchor="w", pady=(8, 0))
         self.burn_in = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Вшить субтитры в выходной MP4 (дополнительно сохранится SRT)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
+        ttk.Checkbutton(opts, text="Вшить субтитры в исходный MP4 (оригинал сохранится в резервной копии)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
 
         self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(3, 7))
@@ -130,6 +132,7 @@ class SubtitleApp(tk.Tk):
         self.worker.start()
 
     def _process(self, video: Path, model_name: str, burn: bool) -> None:
+        temp_output = None
         try:
             from faster_whisper import WhisperModel
             from argostranslate import package, translate
@@ -159,16 +162,30 @@ class SubtitleApp(tk.Tk):
 
             self.events.put(("progress", 2, f"Загружаю модель {model_name}…"))
             model = WhisperModel(model_name, device="auto", compute_type="int8")
-            self.events.put(("progress", 5, "Распознаю английскую речь…"))
             duration = self._probe_duration(video)
-            segments, info = model.transcribe(str(video), language="en", vad_filter=True, beam_size=5)
-            source = []
-            for seg in segments:
-                text = seg.text.strip()
-                if text:
-                    source.append((float(seg.start), float(seg.end), text))
-                if duration:
-                    self.events.put(("progress", min(25, 5 + int(20 * float(seg.end) / duration)), "Распознаю английскую речь…"))
+
+            def collect_segments(active_model, stage_label):
+                segments, _ = active_model.transcribe(str(video), language="en", vad_filter=True, beam_size=5)
+                collected = []
+                for seg in segments:
+                    text = seg.text.strip()
+                    if text:
+                        collected.append((float(seg.start), float(seg.end), text))
+                    if duration:
+                        self.events.put(("progress", min(25, 5 + int(20 * float(seg.end) / duration)), stage_label))
+                return collected
+
+            self.events.put(("progress", 5, "Распознаю английскую речь…"))
+            try:
+                source = collect_segments(model, "Распознаю английскую речь…")
+            except RuntimeError as exc:
+                error_text = str(exc).lower()
+                if not any(marker in error_text for marker in ("cublas", "cudnn", "cuda")):
+                    raise
+                LOGGER.warning("CUDA недоступна; повторно запускаю распознавание на CPU: %s", exc)
+                self.events.put(("progress", 5, "CUDA недоступна — повторно распознаю на процессоре…"))
+                model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                source = collect_segments(model, "Распознаю на процессоре…")
             if not source:
                 raise RuntimeError("Речь не найдена. Проверьте, что в видео есть английская речь.")
 
@@ -194,10 +211,12 @@ class SubtitleApp(tk.Tk):
                     f.write(f"{i}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
             self.events.put(("progress", 80, "SRT сохранён. Готовлю выходной MP4…" if burn else "SRT сохранён."))
 
-            output = video.with_name(video.stem + ".ru.mp4")
+            output = video if burn else None
+            backup = None
             if burn:
+                temp_output = video.with_name(f"{video.stem}.burnin.{uuid.uuid4().hex}.mp4")
                 filter_path = ffmpeg_subtitle_path(srt)
-                command = ["ffmpeg", "-y", "-i", str(video), "-vf", f"subtitles='{filter_path}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
+                command = ["ffmpeg", "-y", "-i", str(video), "-vf", f"subtitles='{filter_path}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(temp_output)]
                 proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
                 assert proc.stdout is not None
                 ffmpeg_tail = []
@@ -210,12 +229,34 @@ class SubtitleApp(tk.Tk):
                         percent = min(99, 80 + int(19 * int(match.group(1)) / (duration * 1_000_000)))
                         self.events.put(("progress", percent, "Вшиваю субтитры в MP4…"))
                 code = proc.wait()
-                if code:
+                if code or not temp_output.is_file() or temp_output.stat().st_size == 0:
                     LOGGER.error("FFmpeg завершился с кодом %s. Последний вывод:\n%s", code, "\n".join(ffmpeg_tail))
-                    raise RuntimeError("FFmpeg не смог обработать видео. Проверьте logs\subtitle_translator.log.")
+                    raise RuntimeError("FFmpeg не создал корректный MP4. Исходник сохранён без изменений; см. logs\subtitle_translator.log.")
+                if not self._probe_duration(temp_output):
+                    raise RuntimeError("Проверка временного MP4 не прошла. Исходник сохранён без изменений.")
+
+                backup = video.with_name(f"{video.stem}.original{video.suffix}")
+                if backup.exists():
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup = video.with_name(f"{video.stem}.original.{stamp}.{uuid.uuid4().hex[:6]}{video.suffix}")
+                video.replace(backup)
+                try:
+                    temp_output.replace(video)
+                except Exception:
+                    if backup.exists() and not video.exists():
+                        backup.replace(video)
+                    raise
+                LOGGER.info("Исходный MP4 заменён версией с субтитрами; оригинал сохранён в %s", backup)
+
             note = f"\nНе удалось перевести фрагментов: {failed}; в этих строках оставлен английский текст." if failed else ""
-            self.events.put(("done", f"Готово!\nSRT: {srt}\n" + (f"MP4: {output}" if burn else "Вшивание в видео отключено.") + note))
+            video_result = f"Исходный MP4 обновлён: {output}\nРезервная копия оригинала: {backup}" if burn else "Вшивание в видео отключено."
+            self.events.put(("done", f"Готово!\nSRT: {srt}\n{video_result}" + note))
         except Exception as exc:
+            if burn and temp_output is not None and temp_output.exists():
+                try:
+                    temp_output.unlink()
+                except OSError:
+                    LOGGER.exception("Не удалось удалить временный файл %s", temp_output)
             LOGGER.exception("Ошибка обработки видео %s", video)
             self.events.put(("error", f"{exc}\n\nПодробный лог: {LOG_FILE}"))
 
