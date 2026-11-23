@@ -62,7 +62,7 @@ class SubtitleApp(tk.Tk):
         self.model = tk.StringVar(value="small")
         ttk.Combobox(row, textvariable=self.model, values=("tiny", "base", "small", "medium", "large-v3"), state="readonly", width=11).pack(side="left", padx=(8, 18))
         ttk.Label(row, text="Переводчик: встроенная модель EN → RU").pack(side="left")
-        ttk.Label(opts, text="Перевод выполняется без Ollama и интернета. Модель включена в ZIP.", wraplength=620).pack(anchor="w", pady=(8, 0))
+        ttk.Label(opts, text="Перевод выполняется без Ollama и интернета. Модель встроена в программу.", wraplength=620).pack(anchor="w", pady=(8, 0))
         self.burn_in = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Вшить субтитры в выходной MP4 (дополнительно сохранится SRT)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
 
