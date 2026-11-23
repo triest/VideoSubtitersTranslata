@@ -65,11 +65,28 @@ class SubtitleApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("690x440")
-        self.minsize(600, 400)
+        self.geometry("740x500")
+        self.minsize(650, 460)
         self.video_path: Path | None = None
         self.events: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.settings_path = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SubtitleTranslator" / "settings.json"
+        try:
+            saved_settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved_settings = {}
+        if not isinstance(saved_settings, dict):
+            saved_settings = {}
+        try:
+            from work.context_translation import default_model_path
+            default_qwen_path = str(default_model_path())
+        except Exception:
+            default_qwen_path = r"J:\models\lmstudio-community\Qwen2.5-VL-7B-Instruct-GGUF\Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+        translation_mode = saved_settings.get("translation_mode", "Qwen2.5-VL 7B")
+        if translation_mode not in ("Qwen2.5-VL 7B", "Argos — встроенный"):
+            translation_mode = "Qwen2.5-VL 7B"
+        self.translation_mode = tk.StringVar(value=translation_mode)
+        self.qwen_model_path = tk.StringVar(value=saved_settings.get("qwen_model_path", default_qwen_path))
         self._build_ui()
         self.after(100, self._poll_events)
         LOGGER.info("Приложение запущено")
@@ -98,10 +115,14 @@ class SubtitleApp(tk.Tk):
         ttk.Label(row, text="Распознавание:").pack(side="left")
         self.model = tk.StringVar(value="medium")
         ttk.Combobox(row, textvariable=self.model, values=("small", "medium"), state="readonly", width=11).pack(side="left", padx=(8, 18))
-        ttk.Label(row, text="Переводчик: встроенная модель EN → RU").pack(side="left")
-        ttk.Label(opts, text="Встроенный перевод работает без Ollama и интернета.", wraplength=620).pack(anchor="w", pady=(8, 0))
-        self.use_video_context = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Улучшать контекст локальной Qwen2.5-VL из LM Studio (диалог + кадр видео, если модель загружена)", variable=self.use_video_context).pack(anchor="w", pady=(7, 0))
+        ttk.Label(row, text="Перевод:").pack(side="left")
+        ttk.Combobox(row, textvariable=self.translation_mode, values=("Qwen2.5-VL 7B", "Argos — встроенный"), state="readonly", width=24).pack(side="left", padx=(8, 0))
+        model_row = ttk.Frame(opts)
+        model_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(model_row, text="Файл Qwen:").pack(side="left")
+        ttk.Entry(model_row, textvariable=self.qwen_model_path).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(model_row, text="Выбрать…", command=self.choose_qwen_model).pack(side="right")
+        ttk.Label(opts, text="Qwen запускается отдельным локальным llama.cpp: LM Studio открывать не нужно. Если Qwen или движок недоступны, используется Argos.", wraplength=660).pack(anchor="w", pady=(8, 0))
         self.burn_in = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Вшить субтитры в исходный MP4 (оригинал сохранится в резервной копии)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
 
@@ -118,6 +139,27 @@ class SubtitleApp(tk.Tk):
             self.video_path = Path(name)
             self.path_label.configure(text=str(self.video_path))
 
+    def choose_qwen_model(self) -> None:
+        current = Path(self.qwen_model_path.get())
+        name = filedialog.askopenfilename(
+            title="Выберите локальный файл модели Qwen",
+            initialdir=str(current.parent) if current.parent.exists() else str(Path.home()),
+            filetypes=(("Модель GGUF", "*.gguf"), ("Все файлы", "*.*")),
+        )
+        if name:
+            self.qwen_model_path.set(name)
+            self._save_settings()
+
+    def _save_settings(self) -> None:
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_path.write_text(json.dumps({
+                "translation_mode": self.translation_mode.get(),
+                "qwen_model_path": self.qwen_model_path.get().strip(),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            LOGGER.exception("Не удалось сохранить настройки модели")
+
     def start(self) -> None:
         if not self.video_path or not self.video_path.is_file():
             LOGGER.warning("Обработка не начата: видеофайл не выбран или недоступен")
@@ -131,11 +173,13 @@ class SubtitleApp(tk.Tk):
         self.choose_btn.configure(state="disabled")
         self.progress.configure(value=0)
         self.status.set("Подготовка локального распознавания…")
-        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), self.burn_in.get(), self.use_video_context.get()), daemon=True)
+        self._save_settings()
+        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), self.burn_in.get(), self.translation_mode.get(), self.qwen_model_path.get().strip()), daemon=True)
         self.worker.start()
 
-    def _process(self, video: Path, model_name: str, burn: bool, use_video_context: bool = True) -> None:
+    def _process(self, video: Path, model_name: str, burn: bool, translation_mode: str = "Qwen2.5-VL 7B", qwen_model_path: str = "") -> None:
         temp_output = None
+        context_model = None
         try:
             from argostranslate import package, translate
 
@@ -174,13 +218,14 @@ class SubtitleApp(tk.Tk):
             total = len(source)
             context_translations: list[str] = [""] * total
             context_failed: set[int] = set()
-            context_model = None
-            if use_video_context:
+            if translation_mode == "Qwen2.5-VL 7B":
                 try:
                     from work.context_translation import LocalContextTranslator
-                    context_model = LocalContextTranslator(str(video), LOGGER)
-                except Exception:
-                    LOGGER.exception("Не удалось подготовить локальный перевод с контекстом")
+                    self.events.put(("progress", 25, "Запускаю Qwen напрямую на компьютере…"))
+                    context_model = LocalContextTranslator(str(video), LOGGER, qwen_model_path or None)
+                except Exception as exc:
+                    LOGGER.exception("Не удалось запустить автономный Qwen/llama.cpp")
+                    self.events.put(("progress", 25, f"Qwen недоступна ({exc}); использую встроенный перевод…"))
                 if context_model and context_model.available:
                     self.events.put(("progress", 25, "Учитываю диалог и кадры видео локальной моделью…"))
                     context_translations, context_failed = context_model.translate(
@@ -188,7 +233,7 @@ class SubtitleApp(tk.Tk):
                         lambda done, count: self.events.put(("progress", int(25 + 43 * done / count), f"Контекстный перевод: {done} из {count}")),
                     )
                 else:
-                    self.events.put(("progress", 25, "Локальная модель контекста не загружена; использую встроенный перевод…"))
+                    self.events.put(("progress", 25, "Использую встроенный перевод…"))
 
             translated = []
             failed = 0
@@ -267,6 +312,12 @@ class SubtitleApp(tk.Tk):
                     LOGGER.exception("Не удалось удалить временный файл %s", temp_output)
             LOGGER.exception("Ошибка обработки видео %s", video)
             self.events.put(("error", f"{exc}\n\nПодробный лог: {LOG_FILE}"))
+        finally:
+            if context_model:
+                try:
+                    context_model.close()
+                except Exception:
+                    LOGGER.exception("Не удалось корректно остановить локальный Qwen")
 
     def _transcribe_with_audiobook_asr(self, video: Path, model_name: str) -> list[tuple[float, float, str]]:
         asr_python = Path(r"J:\audiobook\.venv_cosyvoice3\Scripts\python.exe")

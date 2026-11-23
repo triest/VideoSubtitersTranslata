@@ -1,71 +1,139 @@
-"""Optional, fully local subtitle translation with dialogue and video context.
-
-Uses an already-running LM Studio OpenAI-compatible server. The app remains
-usable without it: callers can fall back to their bundled Argos translator.
-"""
+"""Run the local Qwen GGUF model directly with llama.cpp and video context."""
 from __future__ import annotations
 
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
+import time
 import urllib.request
 from typing import Callable, Sequence
 
 
-API_ROOT = "http://127.0.0.1:1234/v1"
 BATCH_SIZE = 12
+MODEL_FILENAME = "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+MMPROJ_FILENAME = "mmproj-model-f16.gguf"
+MODEL_SEARCH_ROOTS = (
+    Path(r"J:\models\lmstudio-community\Qwen2.5-VL-7B-Instruct-GGUF"),
+    Path.home() / ".lmstudio" / "models" / "lmstudio-community" / "Qwen2.5-VL-7B-Instruct-GGUF",
+)
+MODEL_ALIAS = "subtitle-qwen"
+
+
+def default_model_path() -> Path:
+    for root in MODEL_SEARCH_ROOTS:
+        candidate = root / MODEL_FILENAME
+        if candidate.is_file():
+            return candidate
+    return MODEL_SEARCH_ROOTS[0] / MODEL_FILENAME
 
 
 class LocalContextTranslator:
-    def __init__(self, video: str, logger: logging.Logger):
+    """Starts its own loopback llama.cpp process; never starts LM Studio."""
+
+    def __init__(self, video: str, logger: logging.Logger, model_path: str | Path | None = None):
         self.video = video
         self.logger = logger
-        self.model = self._find_model()
+        self.model_path = Path(model_path) if model_path else default_model_path()
+        self.mmproj_path = self.model_path.parent / MMPROJ_FILENAME
+        self.process: subprocess.Popen | None = None
+        self.port: int | None = None
+        self.log_handle = None
+        self.available = False
+        self.api_root = ""
+        self._start_server()
 
-    @property
-    def available(self) -> bool:
-        return self.model is not None
+    @staticmethod
+    def find_server() -> Path | None:
+        explicit = os.environ.get("SUBTITLE_LLAMA_SERVER")
+        if explicit and Path(explicit).is_file():
+            return Path(explicit)
+        bundled = Path(__file__).resolve().parent.parent / "runtime" / "llama-server.exe"
+        if bundled.is_file():
+            return bundled
 
-    def _request(self, path: str, payload: dict | None = None, timeout: int = 15) -> dict:
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        backends = Path.home() / ".lmstudio" / "extensions" / "backends"
+        patterns = (
+            "llama.cpp-win-x86_64-vulkan-avx2-*",
+            "llama.cpp-win-x86_64-avx2-*",
+        )
+        for pattern in patterns:
+            folders = sorted(backends.glob(pattern), key=LocalContextTranslator._version_key, reverse=True)
+            for folder in folders:
+                server = folder / "llama-server.exe"
+                if server.is_file():
+                    return server
+        return shutil.which("llama-server") and Path(shutil.which("llama-server"))
+
+    @staticmethod
+    def _version_key(path: Path) -> tuple[int, ...]:
+        found = re.search(r"-(\d+(?:\.\d+)+)$", path.name)
+        return tuple(int(part) for part in found.group(1).split(".")) if found else (0,)
+
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _start_server(self) -> None:
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"Не найден файл Qwen GGUF: {self.model_path}")
+        if not self.mmproj_path.is_file():
+            raise FileNotFoundError(f"Рядом с Qwen не найден файл обработки изображений: {self.mmproj_path}")
+        server = self.find_server()
+        if not server:
+            raise FileNotFoundError("Не найден llama-server.exe. Укажите его через переменную SUBTITLE_LLAMA_SERVER.")
+
+        self.port = self._free_port()
+        self.api_root = f"http://127.0.0.1:{self.port}"
+        log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SubtitleTranslator" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_handle = (log_dir / "qwen_engine.log").open("ab", buffering=0)
+        command = [
+            str(server), "-m", str(self.model_path), "--mmproj", str(self.mmproj_path),
+            "--host", "127.0.0.1", "--port", str(self.port), "--alias", MODEL_ALIAS,
+            "-c", "8192", "-ngl", "99", "--no-webui",
+        ]
+        environment = os.environ.copy()
+        environment["PATH"] = str(server.parent) + os.pathsep + environment.get("PATH", "")
+        self.logger.info("Запускаю автономный llama.cpp: %s", server)
+        self.logger.info("Загружаю Qwen: %s", self.model_path)
+        self.process = subprocess.Popen(
+            command, cwd=str(server.parent), env=environment,
+            stdin=subprocess.DEVNULL, stdout=self.log_handle, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(f"llama.cpp завершился при загрузке модели (код {self.process.returncode}). См. qwen_engine.log")
+            try:
+                request = urllib.request.Request(f"{self.api_root}/health")
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    if response.status == 200:
+                        self.available = True
+                        self.logger.info("Qwen загружена автономным llama.cpp на порту %d", self.port)
+                        return
+            except Exception:
+                pass
+            time.sleep(1)
+        self.close()
+        raise TimeoutError("Qwen не успела загрузиться за 4 минуты. Подробности: qwen_engine.log")
+
+    def _request(self, payload: dict, timeout: int = 15) -> dict:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            f"{API_ROOT}/{path}", data=data,
+            f"{self.api_root}/v1/chat/completions", data=data,
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-
-    def _find_model(self) -> str | None:
-        try:
-            lms = shutil.which("lms")
-            if not lms:
-                candidate = Path.home() / ".lmstudio" / "bin" / "lms.exe"
-                lms = str(candidate) if candidate.is_file() else None
-            if not lms:
-                self.logger.info("LM Studio CLI не найден; используется встроенный переводчик")
-                return None
-            proc = subprocess.run([lms, "ps", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=10, check=True)
-            loaded = json.loads(proc.stdout)
-            models = [
-                {"id": item.get("identifier") or item.get("modelKey", ""), "key": item.get("modelKey", "")}
-                for item in loaded
-                if item.get("type") == "llm" and item.get("status") in ("idle", "loaded", "processing")
-            ]
-        except Exception as exc:
-            self.logger.info("Не удалось проверить загруженную локальную модель: %s", exc)
-            return None
-        for item in models:
-            model_id = str(item.get("id", ""))
-            model_key = str(item.get("key", ""))
-            if "qwen2.5-vl" in (model_id + " " + model_key).lower():
-                self.logger.info("Локальная модель контекста: %s", model_id)
-                return model_id
-        self.logger.info("В LM Studio не загружена Qwen2.5-VL; используется встроенный переводчик")
-        return None
 
     def _frame_data_url(self, seconds: float) -> str | None:
         try:
@@ -111,8 +179,8 @@ class LocalContextTranslator:
         content: list[dict] = [{"type": "text", "text": prompt}]
         if frame:
             content.append({"type": "image_url", "image_url": {"url": frame}})
-        response = self._request("chat/completions", {
-            "model": self.model,
+        response = self._request({
+            "model": MODEL_ALIAS,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.15,
             "max_tokens": max(700, len(segments) * 100),
@@ -140,3 +208,18 @@ class LocalContextTranslator:
                 failed.update(range(offset, offset + len(batch)))
             progress(min(len(segments), offset + len(batch)), len(segments))
         return results, failed
+
+    def close(self) -> None:
+        self.available = False
+        process = self.process
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        self.process = None
+        if self.log_handle:
+            self.log_handle.close()
+            self.log_handle = None
