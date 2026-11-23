@@ -1,2 +1,1 @@
-faster-whisper>=1.1.0,<2.0.0
 argostranslate>=1.9.6,<2.0.0

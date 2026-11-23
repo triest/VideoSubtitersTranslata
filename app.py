@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import queue
 import re
@@ -81,7 +82,7 @@ class SubtitleApp(tk.Tk):
         outer = ttk.Frame(self, padding=22)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Английская речь → русские субтитры", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="Распознавание и перевод работают локально. Модель перевода уже включена в пакет.", wraplength=630).pack(anchor="w", pady=(6, 18))
+        ttk.Label(outer, text="Распознавание использует локальный ASR из J:\\audiobook; встроенный перевод работает без интернета.", wraplength=630).pack(anchor="w", pady=(6, 18))
 
         choose = ttk.Frame(outer)
         choose.pack(fill="x")
@@ -95,10 +96,12 @@ class SubtitleApp(tk.Tk):
         row = ttk.Frame(opts)
         row.pack(fill="x")
         ttk.Label(row, text="Распознавание:").pack(side="left")
-        self.model = tk.StringVar(value="small")
-        ttk.Combobox(row, textvariable=self.model, values=("tiny", "base", "small", "medium", "large-v3"), state="readonly", width=11).pack(side="left", padx=(8, 18))
+        self.model = tk.StringVar(value="medium")
+        ttk.Combobox(row, textvariable=self.model, values=("small", "medium"), state="readonly", width=11).pack(side="left", padx=(8, 18))
         ttk.Label(row, text="Переводчик: встроенная модель EN → RU").pack(side="left")
-        ttk.Label(opts, text="Перевод выполняется без Ollama и интернета. Модель встроена в программу.", wraplength=620).pack(anchor="w", pady=(8, 0))
+        ttk.Label(opts, text="Встроенный перевод работает без Ollama и интернета.", wraplength=620).pack(anchor="w", pady=(8, 0))
+        self.use_video_context = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Улучшать контекст локальной Qwen2.5-VL из LM Studio (диалог + кадр видео, если модель загружена)", variable=self.use_video_context).pack(anchor="w", pady=(7, 0))
         self.burn_in = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Вшить субтитры в исходный MP4 (оригинал сохранится в резервной копии)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
 
@@ -127,14 +130,13 @@ class SubtitleApp(tk.Tk):
         self.start_btn.configure(state="disabled")
         self.choose_btn.configure(state="disabled")
         self.progress.configure(value=0)
-        self.status.set("Подготовка… При первом запуске модель распознавания скачается автоматически.")
-        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), self.burn_in.get()), daemon=True)
+        self.status.set("Подготовка локального распознавания…")
+        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), self.burn_in.get(), self.use_video_context.get()), daemon=True)
         self.worker.start()
 
-    def _process(self, video: Path, model_name: str, burn: bool) -> None:
+    def _process(self, video: Path, model_name: str, burn: bool, use_video_context: bool = True) -> None:
         temp_output = None
         try:
-            from faster_whisper import WhisperModel
             from argostranslate import package, translate
 
             self.events.put(("progress", 1, "Подключаю встроенный переводчик…"))
@@ -160,52 +162,58 @@ class SubtitleApp(tk.Tk):
             if translator is None:
                 raise RuntimeError("Не удалось инициализировать встроенную модель английского → русского перевода.")
 
-            self.events.put(("progress", 2, f"Загружаю модель {model_name}…"))
-            model = WhisperModel(model_name, device="auto", compute_type="int8")
             duration = self._probe_duration(video)
-
-            def collect_segments(active_model, stage_label):
-                segments, _ = active_model.transcribe(str(video), language="en", vad_filter=True, beam_size=5)
-                collected = []
-                for seg in segments:
-                    text = seg.text.strip()
-                    if text:
-                        collected.append((float(seg.start), float(seg.end), text))
-                    if duration:
-                        self.events.put(("progress", min(25, 5 + int(20 * float(seg.end) / duration)), stage_label))
-                return collected
-
-            self.events.put(("progress", 5, "Распознаю английскую речь…"))
-            try:
-                source = collect_segments(model, "Распознаю английскую речь…")
-            except RuntimeError as exc:
-                error_text = str(exc).lower()
-                if not any(marker in error_text for marker in ("cublas", "cudnn", "cuda")):
-                    raise
-                LOGGER.warning("CUDA недоступна; повторно запускаю распознавание на CPU: %s", exc)
-                self.events.put(("progress", 5, "CUDA недоступна — повторно распознаю на процессоре…"))
-                model = WhisperModel(model_name, device="cpu", compute_type="int8")
-                source = collect_segments(model, "Распознаю на процессоре…")
+            source = self._transcribe_with_audiobook_asr(video, model_name)
             if not source:
                 raise RuntimeError("Речь не найдена. Проверьте, что в видео есть английская речь.")
+            source = self._group_words_into_cues(source)
+            if not source:
+                raise RuntimeError("ASR не вернул слов с таймкодами. Субтитры не созданы.")
+            LOGGER.info("Субтитры сгруппированы по словам: %d реплик; длинная реплика не более %.2f с", len(source), max(end - start for start, end, _ in source))
+
+            total = len(source)
+            context_translations: list[str] = [""] * total
+            context_failed: set[int] = set()
+            context_model = None
+            if use_video_context:
+                try:
+                    from work.context_translation import LocalContextTranslator
+                    context_model = LocalContextTranslator(str(video), LOGGER)
+                except Exception:
+                    LOGGER.exception("Не удалось подготовить локальный перевод с контекстом")
+                if context_model and context_model.available:
+                    self.events.put(("progress", 25, "Учитываю диалог и кадры видео локальной моделью…"))
+                    context_translations, context_failed = context_model.translate(
+                        source,
+                        lambda done, count: self.events.put(("progress", int(25 + 43 * done / count), f"Контекстный перевод: {done} из {count}")),
+                    )
+                else:
+                    self.events.put(("progress", 25, "Локальная модель контекста не загружена; использую встроенный перевод…"))
 
             translated = []
             failed = 0
-            total = len(source)
-            for i, (start, end, original) in enumerate(source, 1):
-                try:
-                    translated_text = translator.translate(original).strip()
-                    if not translated_text:
-                        raise RuntimeError("Пустой ответ переводчика")
-                except Exception:
-                    LOGGER.exception("Ошибка перевода субтитра %d (%.3f–%.3f сек.)", i, start, end)
-                    translated_text = original
-                    failed += 1
+            for index, (start, end, original) in enumerate(source):
+                if context_model and context_model.available and index not in context_failed and context_translations[index]:
+                    translated_text = context_translations[index]
+                else:
+                    try:
+                        translated_text = translator.translate(original).strip()
+                        if not translated_text:
+                            raise RuntimeError("Пустой ответ переводчика")
+                    except Exception:
+                        LOGGER.exception("Ошибка перевода субтитра %d (%.3f–%.3f сек.)", index + 1, start, end)
+                        translated_text = original
+                        failed += 1
                 translated.append((start, end, translated_text))
-                if i % 4 == 0 or i == total:
-                    self.events.put(("progress", int(25 + 53 * i / total), f"Перевод: {i} из {total}"))
+                if (index + 1) % 12 == 0 or index + 1 == total:
+                    self.events.put(("progress", int(68 + 10 * (index + 1) / total), f"Подготовка субтитров: {index + 1} из {total}"))
+            if context_model and context_model.available:
+                LOGGER.info("Контекстный перевод: %d/%d реплик; резервный перевод Argos использован для %d", total - len(context_failed), total, len(context_failed))
 
-            srt = video.with_name(video.stem + ".ru.srt")
+            srt_dir = video.parent / "subtitles" if burn else video.parent
+            if burn:
+                srt_dir.mkdir(parents=True, exist_ok=True)
+            srt = srt_dir / (video.stem + ".ru.srt")
             with srt.open("w", encoding="utf-8-sig", newline="\n") as f:
                 for i, (start, end, text) in enumerate(translated, 1):
                     f.write(f"{i}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
@@ -216,7 +224,7 @@ class SubtitleApp(tk.Tk):
             if burn:
                 temp_output = video.with_name(f"{video.stem}.burnin.{uuid.uuid4().hex}.mp4")
                 filter_path = ffmpeg_subtitle_path(srt)
-                command = ["ffmpeg", "-y", "-i", str(video), "-vf", f"subtitles='{filter_path}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(temp_output)]
+                command = ["ffmpeg", "-y", "-i", str(video), "-map", "0:v:0", "-map", "0:a?", "-sn", "-vf", f"subtitles='{filter_path}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(temp_output)]
                 proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
                 assert proc.stdout is not None
                 ffmpeg_tail = []
@@ -259,6 +267,120 @@ class SubtitleApp(tk.Tk):
                     LOGGER.exception("Не удалось удалить временный файл %s", temp_output)
             LOGGER.exception("Ошибка обработки видео %s", video)
             self.events.put(("error", f"{exc}\n\nПодробный лог: {LOG_FILE}"))
+
+    def _transcribe_with_audiobook_asr(self, video: Path, model_name: str) -> list[tuple[float, float, str]]:
+        asr_python = Path(r"J:\audiobook\.venv_cosyvoice3\Scripts\python.exe")
+        asr_worker = Path(__file__).resolve().parent / "work" / "asr_video_worker.py"
+        if not asr_python.is_file() or not asr_worker.is_file():
+            raise RuntimeError("Не найден локальный ASR из J:\\audiobook. Проверьте папку проекта и его окружение.")
+
+        env = os.environ.copy()
+        env["SUBTITLE_ASR_MODEL"] = model_name
+        self.events.put(("progress", 2, f"Подключаю ASR из J:\\audiobook ({model_name})…"))
+        proc = subprocess.Popen(
+            [str(asr_python), str(asr_worker)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            ready = proc.stdout.readline().strip()
+            if ready != "@@ready":
+                tail = [ready] if ready else []
+                tail.extend(line.rstrip() for _, line in zip(range(12), proc.stdout))
+                proc.wait(timeout=10)
+                raise RuntimeError("Локальный ASR не запустился: " + " | ".join(tail[-12:]))
+            proc.stdin.write(json.dumps({"video": str(video)}) + "\n")
+            proc.stdin.flush()
+            self.events.put(("progress", 5, f"Распознаю английскую речь локальным ASR ({model_name})…"))
+            response = None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line.startswith("ASR_UNALIGNED_SKIP "):
+                    LOGGER.warning("Пропускаю фразу без точных таймкодов: %s", line[len("ASR_UNALIGNED_SKIP "):])
+                    continue
+                if line.startswith("@@"):
+                    response = json.loads(line[2:])
+                    break
+                match = re.search(r"(\d{1,3})%", line)
+                if match:
+                    value = max(5, min(25, 5 + int(int(match.group(1)) * 0.2)))
+                    LOGGER.info("Прогресс ASR: %s%%", match.group(1))
+                    self.events.put(("progress", value, f"Распознаю английскую речь локальным ASR… {match.group(1)}%"))
+            proc.stdin.close()
+            code = proc.wait()
+            if code:
+                raise RuntimeError(f"Локальный ASR завершился с кодом {code}.")
+            if not response:
+                raise RuntimeError("Локальный ASR завершил работу без результата.")
+            if response.get("error"):
+                raise RuntimeError("Ошибка локального ASR: " + response["error"])
+            LOGGER.info("ASR завершил распознавание: модель %s, устройство %s, слов %d", response.get("model"), response.get("device"), len(response.get("words", [])))
+            return [(float(item["start"]), float(item["end"]), str(item["text"])) for item in response.get("words", [])]
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    @staticmethod
+    def _group_words_into_cues(words: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+        """Create short, non-overlapping captions using Whisper's word-level timestamps."""
+        cleaned = []
+        for start, end, raw_token in sorted(words, key=lambda row: (row[0], row[1])):
+            token = raw_token.strip()
+            if not token or end <= start:
+                continue
+            normalized = re.sub(r"[^a-z0-9]", "", token.lower())
+            if cleaned:
+                prev_start, _, prev_token = cleaned[-1]
+                prev_normalized = re.sub(r"[^a-z0-9]", "", prev_token.strip().lower())
+                if normalized and normalized == prev_normalized and abs(start - prev_start) < 0.25:
+                    continue
+            cleaned.append((start, end, raw_token))
+
+        cues = []
+        group = []
+        last_end = 0.0
+
+        def text_of(items):
+            return "".join(item[2] for item in items).strip()
+
+        def flush():
+            nonlocal group, last_end
+            if not group:
+                return
+            start = max(group[0][0], last_end)
+            end = max(group[-1][1], start + 0.12)
+            text = text_of(group)
+            if text and end - start <= 5.2:
+                cues.append((start, end, text))
+                last_end = end
+            elif text:
+                LOGGER.warning("Пропускаю субтитр без пригодного интервала (%.2f–%.2f с): %s", start, end, text[:80])
+            group = []
+
+        for word in cleaned:
+            candidate = group + [word]
+            candidate_text = text_of(candidate)
+            elapsed = candidate[-1][1] - candidate[0][0]
+            gap = word[0] - group[-1][1] if group else 0.0
+            if group and (gap > 0.85 or len(candidate_text) > 68 or elapsed > 5.2 or len(candidate) > 14):
+                flush()
+                candidate = [word]
+                candidate_text = text_of(candidate)
+                elapsed = word[1] - word[0]
+            group = candidate
+            if re.search(r"[.!?…][\"')\]]?$", word[2].strip()) and (elapsed >= 1.4 or len(candidate_text) >= 28):
+                flush()
+        flush()
+        return cues
 
     @staticmethod
     def _probe_duration(video: Path) -> float | None:
