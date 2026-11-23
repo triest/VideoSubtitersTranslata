@@ -139,16 +139,23 @@ class SubtitleApp(tk.Tk):
             installed = translate.get_installed_languages()
             en = next((lang for lang in installed if lang.code == "en"), None)
             ru = next((lang for lang in installed if lang.code == "ru"), None)
-            if not en or not ru or not any(t.to_lang.code == "ru" for t in en.translations):
+            translator = None
+            if en and ru:
+                try:
+                    translator = en.get_translation(ru)
+                except Exception:
+                    translator = None
+            if translator is None:
                 if not model_file.is_file():
                     raise RuntimeError("Не найдена встроенная модель перевода. Распакуйте программу полностью вместе с папкой models.")
                 package.install_from_path(str(model_file))
                 installed = translate.get_installed_languages()
                 en = next((lang for lang in installed if lang.code == "en"), None)
                 ru = next((lang for lang in installed if lang.code == "ru"), None)
-            if not en or not ru:
+                if en and ru:
+                    translator = en.get_translation(ru)
+            if translator is None:
                 raise RuntimeError("Не удалось инициализировать встроенную модель английского → русского перевода.")
-            translator = en.get_translation(ru)
 
             self.events.put(("progress", 2, f"Загружаю модель {model_name}…"))
             model = WhisperModel(model_name, device="auto", compute_type="int8")
