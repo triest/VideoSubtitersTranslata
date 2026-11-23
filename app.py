@@ -1,17 +1,46 @@
 from __future__ import annotations
 
+import logging
+import os
 import queue
 import re
 import shutil
 import subprocess
 import threading
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "Перевод субтитров"
 VIDEO_TYPES = ("Видео", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v")
+
+
+def configure_logging():
+    logger = logging.getLogger("subtitle_translator")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+    candidates = [
+        Path(__file__).resolve().parent / "logs",
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SubtitleTranslator" / "logs",
+    ]
+    for log_dir in candidates:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "subtitle_translator.log"
+            handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"))
+            logger.addHandler(handler)
+            return logger, log_file
+        except OSError:
+            continue
+    logger.addHandler(logging.NullHandler())
+    return logger, candidates[-1] / "subtitle_translator.log"
+
+
+LOGGER, LOG_FILE = configure_logging()
 
 
 def srt_time(seconds: float) -> str:
@@ -40,6 +69,11 @@ class SubtitleApp(tk.Tk):
         self.worker: threading.Thread | None = None
         self._build_ui()
         self.after(100, self._poll_events)
+        LOGGER.info("Приложение запущено")
+
+    def report_callback_exception(self, exc, value, tb) -> None:
+        LOGGER.error("Необработанная ошибка интерфейса", exc_info=(exc, value, tb))
+        messagebox.showerror(APP_TITLE, f"Ошибка интерфейса. Подробности записаны в файл:\n{LOG_FILE}")
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=22)
@@ -81,10 +115,12 @@ class SubtitleApp(tk.Tk):
 
     def start(self) -> None:
         if not self.video_path or not self.video_path.is_file():
+            LOGGER.warning("Обработка не начата: видеофайл не выбран или недоступен")
             messagebox.showinfo(APP_TITLE, "Сначала выберите видеофайл.")
             return
         if not shutil.which("ffmpeg"):
-            messagebox.showerror("Не найден FFmpeg", "Установите FFmpeg и добавьте его в PATH. Инструкция есть в README.md.")
+            LOGGER.error("Не найден ffmpeg в PATH")
+            messagebox.showerror("Не найден FFmpeg", f"Установите FFmpeg и добавьте его в PATH.\nЛог: {LOG_FILE}")
             return
         self.start_btn.configure(state="disabled")
         self.choose_btn.configure(state="disabled")
@@ -138,6 +174,7 @@ class SubtitleApp(tk.Tk):
                     if not translated_text:
                         raise RuntimeError("Пустой ответ переводчика")
                 except Exception:
+                    LOGGER.exception("Ошибка перевода субтитра %d (%.3f–%.3f сек.)", i, start, end)
                     translated_text = original
                     failed += 1
                 translated.append((start, end, translated_text))
@@ -156,18 +193,24 @@ class SubtitleApp(tk.Tk):
                 command = ["ffmpeg", "-y", "-i", str(video), "-vf", f"subtitles='{filter_path}'", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
                 proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
                 assert proc.stdout is not None
+                ffmpeg_tail = []
                 for line in proc.stdout:
+                    ffmpeg_tail.append(line.rstrip())
+                    if len(ffmpeg_tail) > 60:
+                        del ffmpeg_tail[0]
                     match = re.match(r"out_time_ms=(\d+)", line)
                     if match and duration:
                         percent = min(99, 80 + int(19 * int(match.group(1)) / (duration * 1_000_000)))
                         self.events.put(("progress", percent, "Вшиваю субтитры в MP4…"))
                 code = proc.wait()
                 if code:
-                    raise RuntimeError("FFmpeg не смог обработать видео. Проверьте установку FFmpeg и попробуйте другое имя/место файла.")
+                    LOGGER.error("FFmpeg завершился с кодом %s. Последний вывод:\n%s", code, "\n".join(ffmpeg_tail))
+                    raise RuntimeError("FFmpeg не смог обработать видео. Проверьте logs\subtitle_translator.log.")
             note = f"\nНе удалось перевести фрагментов: {failed}; в этих строках оставлен английский текст." if failed else ""
             self.events.put(("done", f"Готово!\nSRT: {srt}\n" + (f"MP4: {output}" if burn else "Вшивание в видео отключено.") + note))
         except Exception as exc:
-            self.events.put(("error", str(exc)))
+            LOGGER.exception("Ошибка обработки видео %s", video)
+            self.events.put(("error", f"{exc}\n\nПодробный лог: {LOG_FILE}"))
 
     @staticmethod
     def _probe_duration(video: Path) -> float | None:
@@ -194,7 +237,7 @@ class SubtitleApp(tk.Tk):
                     self._unlock()
                 elif event[0] == "error":
                     self.status.set("Обработка не завершена")
-                    messagebox.showerror("Ошибка обработки", event[1] + "\n\nПодробности и решение типичных проблем — в README.md.")
+                    messagebox.showerror("Ошибка обработки", event[1] + f"\n\nЛог ошибок: {LOG_FILE}")
                     self._unlock()
         except queue.Empty:
             pass
@@ -206,4 +249,8 @@ class SubtitleApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    SubtitleApp().mainloop()
+    try:
+        SubtitleApp().mainloop()
+    except Exception:
+        LOGGER.exception("Критическая ошибка при запуске приложения")
+        raise

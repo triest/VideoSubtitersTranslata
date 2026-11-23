@@ -31,3 +31,7 @@
 - `app.py` — приложение.
 - `models/translate-en_ru-1_9.argosmodel` — встроенная модель перевода.
 - `requirements.txt`, `install.bat`, `start.bat` — установка и запуск.
+
+## Журнал ошибок
+
+Ошибки приложения записываются в `logs/subtitle_translator.log`; сбои запуска и установки — в `logs/startup.log`. Основной журнал ротируется автоматически и хранит последние файлы логов. Если приложению нельзя записывать в папку проекта, журнал сохраняется в `%LOCALAPPDATA%\SubtitleTranslator\logs`.
