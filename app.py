@@ -18,6 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "Перевод субтитров"
 VIDEO_TYPES = ("Видео", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v")
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3100-\u312f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\U00020000-\U0002FA1F]")
 
 
 def configure_logging():
@@ -86,6 +87,11 @@ class SubtitleApp(tk.Tk):
         if translation_mode not in ("Qwen2.5-VL 7B", "Argos — встроенный"):
             translation_mode = "Qwen2.5-VL 7B"
         self.translation_mode = tk.StringVar(value=translation_mode)
+        subtitle_mode = saved_settings.get("subtitle_mode", "burn")
+        if subtitle_mode not in ("burn", "soft", "srt"):
+            subtitle_mode = "burn"
+        self.subtitle_mode = tk.StringVar(value=subtitle_mode)
+        self.overwrite_soft = tk.BooleanVar(value=bool(saved_settings.get("overwrite_soft", False)))
         self.qwen_model_path = tk.StringVar(value=saved_settings.get("qwen_model_path", default_qwen_path))
         self._build_ui()
         self.after(100, self._poll_events)
@@ -123,8 +129,20 @@ class SubtitleApp(tk.Tk):
         ttk.Entry(model_row, textvariable=self.qwen_model_path).pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(model_row, text="Выбрать…", command=self.choose_qwen_model).pack(side="right")
         ttk.Label(opts, text="Qwen запускается отдельным локальным llama.cpp: LM Studio открывать не нужно. Если Qwen или движок недоступны, используется Argos.", wraplength=660).pack(anchor="w", pady=(8, 0))
-        self.burn_in = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Вшить субтитры в исходный MP4 (оригинал сохранится в резервной копии)", variable=self.burn_in).pack(anchor="w", pady=(12, 0))
+        self.subtitle_mode_labels = {"burn": "Вшить в изображение", "soft": "Встроить отключаемую дорожку", "srt": "Сохранить только SRT"}
+        self.subtitle_mode_choice = tk.StringVar(value=self.subtitle_mode_labels[self.subtitle_mode.get()])
+        mode_row = ttk.Frame(opts)
+        mode_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(mode_row, text="Субтитры:").pack(side="left")
+        subtitle_mode_combo = ttk.Combobox(mode_row, textvariable=self.subtitle_mode_choice, values=tuple(self.subtitle_mode_labels.values()), state="readonly", width=36)
+        subtitle_mode_combo.pack(side="left", padx=8)
+        self.overwrite_soft_check = ttk.Checkbutton(
+            opts,
+            text="Заменить исходный MP4/MKV после проверки (без резервной копии)",
+            variable=self.overwrite_soft,
+        )
+        self.subtitle_mode_choice.trace_add("write", lambda *_: self._update_overwrite_option())
+        self._update_overwrite_option()
 
         self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(3, 7))
@@ -138,6 +156,19 @@ class SubtitleApp(tk.Tk):
         if name:
             self.video_path = Path(name)
             self.path_label.configure(text=str(self.video_path))
+            self._update_overwrite_option()
+
+    def _update_overwrite_option(self) -> None:
+        if self.subtitle_mode_choice.get() != self.subtitle_mode_labels["soft"]:
+            self.overwrite_soft_check.pack_forget()
+            return
+        self.overwrite_soft_check.pack(anchor="w", pady=(6, 0))
+        supported = {".mp4", ".m4v", ".mkv"}
+        if self.video_path and self.video_path.suffix.lower() not in supported:
+            self.overwrite_soft.set(False)
+            self.overwrite_soft_check.configure(state="disabled")
+        else:
+            self.overwrite_soft_check.configure(state="normal")
 
     def choose_qwen_model(self) -> None:
         current = Path(self.qwen_model_path.get())
@@ -156,6 +187,8 @@ class SubtitleApp(tk.Tk):
             self.settings_path.write_text(json.dumps({
                 "translation_mode": self.translation_mode.get(),
                 "qwen_model_path": self.qwen_model_path.get().strip(),
+                "subtitle_mode": self.subtitle_mode.get(),
+                "overwrite_soft": self.overwrite_soft.get(),
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             LOGGER.exception("Не удалось сохранить настройки модели")
@@ -173,11 +206,18 @@ class SubtitleApp(tk.Tk):
         self.choose_btn.configure(state="disabled")
         self.progress.configure(value=0)
         self.status.set("Подготовка локального распознавания…")
+        mode_by_label = {label: mode for mode, label in self.subtitle_mode_labels.items()}
+        mode = mode_by_label.get(self.subtitle_mode_choice.get(), "burn")
+        self.subtitle_mode.set(mode)
         self._save_settings()
-        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), self.burn_in.get(), self.translation_mode.get(), self.qwen_model_path.get().strip()), daemon=True)
+        overwrite_original = mode == "soft" and self.overwrite_soft.get()
+        self.worker = threading.Thread(target=self._process, args=(self.video_path, self.model.get(), mode, self.translation_mode.get(), self.qwen_model_path.get().strip(), overwrite_original), daemon=True)
         self.worker.start()
 
-    def _process(self, video: Path, model_name: str, burn: bool, translation_mode: str = "Qwen2.5-VL 7B", qwen_model_path: str = "") -> None:
+    def _process(self, video: Path, model_name: str, subtitle_mode: str | bool, translation_mode: str = "Qwen2.5-VL 7B", qwen_model_path: str = "", overwrite_original: bool = False) -> None:
+        mode = "burn" if subtitle_mode is True else "srt" if subtitle_mode is False else subtitle_mode
+        burn = mode == "burn"
+        soft = mode == "soft"
         temp_output = None
         context_model = None
         try:
@@ -249,20 +289,31 @@ class SubtitleApp(tk.Tk):
                         LOGGER.exception("Ошибка перевода субтитра %d (%.3f–%.3f сек.)", index + 1, start, end)
                         translated_text = original
                         failed += 1
+                if CJK_RE.search(translated_text):
+                    LOGGER.warning("Иероглифы в переводе реплики %d (%.3f–%.3f сек.); повторяю через Argos", index + 1, start, end)
+                    try:
+                        argos_text = translator.translate(original).strip()
+                    except Exception:
+                        LOGGER.exception("Argos не смог заменить перевод с иероглифами в реплике %d", index + 1)
+                        argos_text = ""
+                    if argos_text and not CJK_RE.search(argos_text):
+                        translated_text = argos_text
+                    else:
+                        translated_text = CJK_RE.sub("", translated_text).strip() or original
                 translated.append((start, end, translated_text))
                 if (index + 1) % 12 == 0 or index + 1 == total:
                     self.events.put(("progress", int(68 + 10 * (index + 1) / total), f"Подготовка субтитров: {index + 1} из {total}"))
             if context_model and context_model.available:
                 LOGGER.info("Контекстный перевод: %d/%d реплик; резервный перевод Argos использован для %d", total - len(context_failed), total, len(context_failed))
 
-            srt_dir = video.parent / "subtitles" if burn else video.parent
-            if burn:
+            srt_dir = video.parent / "subtitles" if burn or soft else video.parent
+            if burn or soft:
                 srt_dir.mkdir(parents=True, exist_ok=True)
             srt = srt_dir / (video.stem + ".ru.srt")
             with srt.open("w", encoding="utf-8-sig", newline="\n") as f:
                 for i, (start, end, text) in enumerate(translated, 1):
                     f.write(f"{i}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
-            self.events.put(("progress", 80, "SRT сохранён. Готовлю выходной MP4…" if burn else "SRT сохранён."))
+            self.events.put(("progress", 80, "SRT сохранён. Готовлю выходной файл…" if burn or soft else "SRT сохранён."))
 
             output = video if burn else None
             backup = None
@@ -301,11 +352,85 @@ class SubtitleApp(tk.Tk):
                     raise
                 LOGGER.info("Исходный MP4 заменён версией с субтитрами; оригинал сохранён в %s", backup)
 
+            elif soft:
+                suffix = video.suffix.lower()
+                output_suffix = ".mp4" if suffix in (".mp4", ".m4v") else ".mkv"
+                subtitle_codec = "mov_text" if output_suffix == ".mp4" else "srt"
+                output = video if overwrite_original else video.with_name(f"{video.stem}.ru{output_suffix}")
+                disk = shutil.disk_usage(video.parent)
+                existing_output_size = output.stat().st_size if output.exists() and output != video else 0
+                required_free = video.stat().st_size + existing_output_size + 64 * 1024 * 1024
+                if disk.free < required_free:
+                    free_gb = disk.free / (1024 ** 3)
+                    required_gb = required_free / (1024 ** 3)
+                    raise RuntimeError(
+                        f"Недостаточно места на диске {video.parent.drive}: свободно {free_gb:.2f} ГБ, "
+                        f"для временного выходного файла нужно примерно {required_gb:.2f} ГБ. "
+                        "Освободите место или выберите папку на диске с большим объёмом."
+                    )
+                temp_output = output.with_name(f"{output.stem}.tmp.{uuid.uuid4().hex}{output.suffix}")
+                command = [
+                    "ffmpeg", "-y", "-i", str(video), "-i", str(srt),
+                    "-map", "0:v?", "-map", "0:a?", "-map", "1:0",
+                    "-c", "copy", "-c:s", subtitle_codec,
+                    "-metadata:s:s:0", "language=rus", "-metadata:s:s:0", "title=Русский",
+                    "-disposition:s:0", "default",
+                ]
+                if output_suffix == ".mp4":
+                    command += ["-movflags", "+faststart"]
+                command += ["-progress", "pipe:1", "-nostats", str(temp_output)]
+                proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+                assert proc.stdout is not None
+                ffmpeg_tail = []
+                for line in proc.stdout:
+                    ffmpeg_tail.append(line.rstrip())
+                    if len(ffmpeg_tail) > 60:
+                        del ffmpeg_tail[0]
+                    match = re.match(r"out_time_ms=(\d+)", line)
+                    if match and duration:
+                        percent = min(99, 80 + int(19 * int(match.group(1)) / (duration * 1_000_000)))
+                        self.events.put(("progress", percent, "Добавляю отключаемую дорожку субтитров…"))
+                code = proc.wait()
+                if code and output_suffix == ".mp4":
+                    LOGGER.warning("Потоки не удалось скопировать в MP4; повторяю с перекодированием только аудио в AAC")
+                    if temp_output.exists():
+                        temp_output.unlink()
+                    compatible_command = command.copy()
+                    codec_index = compatible_command.index("-c")
+                    compatible_command[codec_index:codec_index + 2] = ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+                    proc = subprocess.Popen(compatible_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        ffmpeg_tail.append(line.rstrip())
+                        if len(ffmpeg_tail) > 60:
+                            del ffmpeg_tail[0]
+                        match = re.match(r"out_time_ms=(\d+)", line)
+                        if match and duration:
+                            percent = min(99, 80 + int(19 * int(match.group(1)) / (duration * 1_000_000)))
+                            self.events.put(("progress", percent, "Добавляю отключаемую дорожку субтитров…"))
+                    code = proc.wait()
+                if code or not temp_output.is_file() or temp_output.stat().st_size == 0:
+                    LOGGER.error("FFmpeg завершился с кодом %s. Последний вывод:\n%s", code, "\n".join(ffmpeg_tail))
+                    raise RuntimeError("FFmpeg не создал файл с дорожкой субтитров. Исходник сохранён без изменений; см. журнал.")
+                if not self._probe_duration(temp_output):
+                    raise RuntimeError("Проверка выходного файла не прошла. Исходник сохранён без изменений.")
+                temp_output.replace(output)
+                temp_output = None
+                LOGGER.info("%s с отключаемой русской дорожкой (%s): %s", "Заменён исходник" if overwrite_original else "Создан файл", subtitle_codec, output)
+
             note = f"\nНе удалось перевести фрагментов: {failed}; в этих строках оставлен английский текст." if failed else ""
-            video_result = f"Исходный MP4 обновлён: {output}\nРезервная копия оригинала: {backup}" if burn else "Вшивание в видео отключено."
+            if burn:
+                video_result = f"Исходный MP4 обновлён: {output}\nРезервная копия оригинала: {backup}"
+            elif soft:
+                if overwrite_original:
+                    video_result = f"Исходное видео заменено проверенным файлом с отключаемой дорожкой «Русский»: {output}\nРезервная копия не создавалась."
+                else:
+                    video_result = f"Видео с отключаемой дорожкой «Русский»: {output}\nВидео и звук скопированы без перекодирования."
+            else:
+                video_result = "Создан только файл субтитров; видео не изменено."
             self.events.put(("done", f"Готово!\nSRT: {srt}\n{video_result}" + note))
         except Exception as exc:
-            if burn and temp_output is not None and temp_output.exists():
+            if temp_output is not None and temp_output.exists():
                 try:
                     temp_output.unlink()
                 except OSError:
